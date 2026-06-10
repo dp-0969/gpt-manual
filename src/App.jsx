@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { supabase } from './supabaseClient';
-import { Plus, Search, LogOut, MapPin } from 'lucide-react';
+import { Plus, Search, LogOut, MapPin, User } from 'lucide-react';
 import './styles.css';
 
 const emptyProfile = {
@@ -21,18 +21,29 @@ function App() {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState(null);
   const [editing, setEditing] = useState(null);
+  const [showSignIn, setShowSignIn] = useState(false);
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => setSession(session));
-    return () => listener.subscription.unsubscribe();
-  }, []);
+    loadProfiles();
 
-  useEffect(() => {
-    if (session) loadProfiles();
-  }, [session]);
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      setShowSignIn(false);
+    });
+
+    const profileChannel = supabase
+      .channel('public:profiles')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => loadProfiles())
+      .subscribe();
+
+    return () => {
+      authListener.subscription.unsubscribe();
+      supabase.removeChannel(profileChannel);
+    };
+  }, []);
 
   async function signIn(e) {
     e.preventDefault();
@@ -48,7 +59,6 @@ function App() {
 
   async function signOut() {
     await supabase.auth.signOut();
-    setProfiles([]);
   }
 
   async function loadProfiles() {
@@ -56,12 +66,34 @@ function App() {
       .from('profiles')
       .select('*')
       .order('created_at', { ascending: false });
-    if (error) alert(error.message);
+    if (error) console.error(error.message);
     else setProfiles(data || []);
+  }
+
+  function startCreateProfile() {
+    if (!session) {
+      setShowSignIn(true);
+      return;
+    }
+    setEditing(emptyProfile);
+  }
+
+  function startEditProfile(profile) {
+    if (!session) {
+      setShowSignIn(true);
+      return;
+    }
+    if (profile.created_by !== session.user.id) {
+      alert('Only the profile creator can edit this profile.');
+      return;
+    }
+    setEditing(profile);
+    setSelected(null);
   }
 
   async function uploadImage(file) {
     if (!file) return null;
+    if (!session) throw new Error('Please sign in before uploading an image.');
     const ext = file.name.split('.').pop();
     const filePath = `${session.user.id}/${crypto.randomUUID()}.${ext}`;
     const { error } = await supabase.storage.from('profile-images').upload(filePath, file);
@@ -71,15 +103,27 @@ function App() {
   }
 
   async function saveProfile(profile, file) {
+    if (!session) {
+      setShowSignIn(true);
+      return;
+    }
+
     setLoading(true);
     try {
       const imageUrl = file ? await uploadImage(file) : profile.image_url;
       const payload = {
-        ...profile,
+        name: profile.name,
+        role: profile.role,
+        location: profile.location,
+        hours: profile.hours,
+        communication: profile.communication,
+        interests: profile.interests,
         image_url: imageUrl || '',
-        owner_id: session.user.id,
+        custom_fields: profile.custom_fields || [],
+        created_by: session.user.id,
         owner_email: session.user.email
       };
+
       if (profile.id) {
         const { error } = await supabase.from('profiles').update(payload).eq('id', profile.id);
         if (error) throw error;
@@ -87,6 +131,7 @@ function App() {
         const { error } = await supabase.from('profiles').insert(payload);
         if (error) throw error;
       }
+
       setEditing(null);
       await loadProfiles();
     } catch (err) {
@@ -96,9 +141,13 @@ function App() {
     }
   }
 
-  async function deleteProfile(id) {
+  async function deleteProfile(profile) {
+    if (!session || profile.created_by !== session.user.id) {
+      alert('Only the profile creator can delete this profile.');
+      return;
+    }
     if (!confirm('Delete this profile?')) return;
-    const { error } = await supabase.from('profiles').delete().eq('id', id);
+    const { error } = await supabase.from('profiles').delete().eq('id', profile.id);
     if (error) alert(error.message);
     else {
       setSelected(null);
@@ -108,19 +157,34 @@ function App() {
 
   const filtered = profiles.filter(p => JSON.stringify(p).toLowerCase().includes(query.toLowerCase()));
 
-  if (!session) {
-    return <main className="login"><section className="loginCard"><h1>Team Manual</h1><p>Sign in with your work email to view and manage team profiles.</p><form onSubmit={signIn}><input value={email} onChange={e => setEmail(e.target.value)} placeholder="name@company.com" type="email" required/><button disabled={loading}>{loading ? 'Sending...' : 'Send magic link'}</button></form></section></main>;
-  }
-
   return <>
-    <header className="topbar"><div><h1>Team Manual</h1><p>Quick team profiles with full details one click away.</p></div><button className="secondary" onClick={signOut}><LogOut size={16}/> Sign out</button></header>
+    <header className="topbar">
+      <div>
+        <h1>Team Manual</h1>
+        <p>Browse quick team profiles. Sign in only when you need to create or edit your own profile.</p>
+      </div>
+      {session ? <button className="secondary" onClick={signOut}><LogOut size={16}/> Sign out</button> : <button className="secondary" onClick={() => setShowSignIn(true)}><User size={16}/> Sign in</button>}
+    </header>
+
     <main className="container">
-      <div className="toolbar"><div className="search"><Search size={18}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search profiles..."/></div><button onClick={() => setEditing(emptyProfile)}><Plus size={18}/> Add profile</button></div>
-      <section className="grid">{filtered.map(profile => <article className="profileCard" key={profile.id} onClick={() => setSelected(profile)}><Avatar profile={profile}/><h2>{profile.name}</h2><p><MapPin size={14}/> {profile.location || 'Location not added'}</p></article>)}</section>
+      <div className="toolbar">
+        <div className="search"><Search size={18}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search profiles..."/></div>
+        <button onClick={startCreateProfile}><Plus size={18}/> Add profile</button>
+      </div>
+      <section className="grid">
+        {filtered.map(profile => <article className="profileCard" key={profile.id} onClick={() => setSelected(profile)}><Avatar profile={profile}/><h2>{profile.name}</h2><p><MapPin size={14}/> {profile.location || 'Location not added'}</p></article>)}
+      </section>
+      {filtered.length === 0 && <p className="empty">No profiles found yet.</p>}
     </main>
-    {selected && <ProfileModal profile={selected} user={session.user} onClose={() => setSelected(null)} onEdit={() => { setEditing(selected); setSelected(null); }} onDelete={() => deleteProfile(selected.id)} />}
+
+    {showSignIn && <SignInModal email={email} setEmail={setEmail} signIn={signIn} loading={loading} onClose={() => setShowSignIn(false)} />}
+    {selected && <ProfileModal profile={selected} user={session?.user} onClose={() => setSelected(null)} onEdit={() => startEditProfile(selected)} onDelete={() => deleteProfile(selected)} />}
     {editing && <EditModal profile={editing} onClose={() => setEditing(null)} onSave={saveProfile} loading={loading} />}
   </>;
+}
+
+function SignInModal({ email, setEmail, signIn, loading, onClose }) {
+  return <div className="overlay"><section className="modal"><button className="close" onClick={onClose}>×</button><h2>Sign in</h2><p className="muted">Sign in with your work email to create or edit your profile. Everyone can still view the team manual without signing in.</p><form onSubmit={signIn}><label className="fieldLabel">Work email<input value={email} onChange={e => setEmail(e.target.value)} placeholder="name@company.com" type="email" required/></label><div className="actions"><button disabled={loading}>{loading ? 'Sending...' : 'Send magic link'}</button></div></form></section></div>;
 }
 
 function Avatar({ profile }) {
@@ -129,8 +193,8 @@ function Avatar({ profile }) {
 }
 
 function ProfileModal({ profile, user, onClose, onEdit, onDelete }) {
-  const canEdit = profile.owner_id === user.id;
-  return <div className="overlay"><section className="modal"><button className="close" onClick={onClose}>×</button><div className="modalTop"><Avatar profile={profile}/><div><h2>{profile.name}</h2><p>{profile.role || 'Team member'}</p></div></div><Info label="Location" value={profile.location}/><Info label="Working hours" value={profile.hours}/><Info label="Best way to communicate" value={profile.communication}/><Info label="Hobbies / interests" value={profile.interests}/>{(profile.custom_fields || []).map((f, i) => <Info key={i} label={f.label} value={f.value}/>) }<p className="owner">Created by {profile.owner_email}</p>{canEdit && <div className="actions"><button onClick={onEdit}>Edit profile</button><button className="danger" onClick={onDelete}>Delete</button></div>}</section></div>;
+  const canEdit = user && profile.created_by === user.id;
+  return <div className="overlay"><section className="modal"><button className="close" onClick={onClose}>×</button><div className="modalTop"><Avatar profile={profile}/><div><h2>{profile.name}</h2><p>{profile.role || 'Team member'}</p></div></div><Info label="Location" value={profile.location}/><Info label="Working hours" value={profile.hours}/><Info label="Best way to communicate" value={profile.communication}/><Info label="Hobbies / interests" value={profile.interests}/>{(profile.custom_fields || []).map((f, i) => <Info key={i} label={f.label} value={f.value}/>) }{profile.owner_email && <p className="owner">Created by {profile.owner_email}</p>}{canEdit && <div className="actions"><button onClick={onEdit}>Edit profile</button><button className="danger" onClick={onDelete}>Delete</button></div>}</section></div>;
 }
 
 function Info({ label, value }) {
