@@ -84,23 +84,17 @@ function App() {
   }
 
   async function uploadImage(file) {
-    if (!file) return null;
+  if (!file) return null;
 
-    const ext = file.name.split('.').pop();
-    const filePath = `team-manual/${crypto.randomUUID()}.${ext}`;
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
 
-    const { error } = await supabase.storage
-      .from('profile-images')
-      .upload(filePath, file);
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
 
-    if (error) throw error;
-
-    const { data } = supabase.storage
-      .from('profile-images')
-      .getPublicUrl(filePath);
-
-    return data.publicUrl;
-  }
+    reader.readAsDataURL(file);
+  });
+}
 
   async function saveProfile(profile, file) {
     if (!isAdmin) {
